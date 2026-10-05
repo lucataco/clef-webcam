@@ -77,6 +77,10 @@
   .editor .row { display: flex; justify-content: space-between; align-items: center; font-family: var(--mono); font-size: 14px; color: var(--muted); }
   .editor button { background: var(--orange); color: #141414; border: 0; border-radius: 8px; padding: 10px 18px; font-family: var(--mono); font-weight: 700; font-size: 14px; cursor: pointer; }
   .error { color: #ff6b6b; }
+  .controls { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .motion-mode { display: inline-flex; align-items: center; gap: 8px; color: var(--fg); cursor: pointer; }
+  .motion-mode input { accent-color: var(--orange); }
+  #mode-hint { color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -87,7 +91,7 @@
     </div>
     <div class="stats">
       <div class="stat"><div class="k"><span class="dot" id="dot"></span>status</div><div class="v" id="status" style="font-size:20px; margin-top:10px">starting</div></div>
-      <div class="stat hot"><div class="k">model latency</div><div class="v"><span id="lat">–</span><small>ms</small></div></div>
+      <div class="stat hot"><div class="k" id="lat-label">model latency</div><div class="v"><span id="lat">–</span><small>ms</small></div></div>
       <div class="stat"><div class="k">decisions / sec</div><div class="v" id="dps">–</div></div>
     </div>
   </header>
@@ -102,8 +106,12 @@
   </main>
 
   <footer>
-    <div><b id="hardware">loading model…</b> · same request body as <b>@cf/cloudflare/clef</b> on Workers AI</div>
-    <div><kbd>E</kbd> edit questions &nbsp; <kbd>space</kbd> pause</div>
+    <div><b id="hardware">loading model…</b> · System One API</div>
+    <div class="controls">
+      <label class="motion-mode"><input id="motion" type="checkbox" checked>Two-frame motion</label>
+      <span id="mode-hint">Earlier + later · uncheck for one frame</span>
+      <span><kbd>E</kbd> edit &nbsp; <kbd>space</kbd> pause</span>
+    </div>
   </footer>
 
   <div class="editor" id="editor">
@@ -114,7 +122,8 @@
 
   <canvas id="canvas" style="display:none"></canvas>
 
-<script>
+<script type="module">
+import { CaptureState, SYSTEMONE_URL, captureFrame, motionPreference, inferenceTiming } from "/camera.mjs";
 // Short instructions and null descriptions keep the prompt small: latency scales with tokens.
 const DEFAULT_QUESTIONS = {
   gesture: {
@@ -140,6 +149,20 @@ const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
 let questions = JSON.parse(localStorage.getItem("clef-questions") || "null") || DEFAULT_QUESTIONS;
 let paused = false;
 const recent = [];
+const capture = new CaptureState(motionPreference(localStorage.getItem("clef-motion")));
+$("motion").checked = capture.motion;
+
+function updateMode() {
+  $("mode-hint").textContent = capture.motion ? "Earlier + later · uncheck for one frame" : "One current frame";
+  recent.length = 0;
+  $("dps").textContent = "–";
+}
+updateMode();
+$("motion").onchange = () => {
+  capture.setMotion($("motion").checked);
+  localStorage.setItem("clef-motion", String(capture.motion));
+  updateMode();
+};
 
 $("schema").value = JSON.stringify(questions, null, 2);
 
@@ -210,12 +233,14 @@ function update(answers) {
 }
 
 function grab() {
-  const w = 448, h = Math.round(w * video.videoHeight / video.videoWidth);
-  canvas.width = w; canvas.height = h;
-  ctx.save(); ctx.translate(w, 0); ctx.scale(-1, 1);
-  ctx.drawImage(video, 0, 0, w, h);
-  ctx.restore();
-  return canvas.toDataURL("image/jpeg", 0.85);
+  return captureFrame(video, () => {
+    const w = 448, h = Math.round(w * video.videoHeight / video.videoWidth);
+    canvas.width = w; canvas.height = h;
+    ctx.save(); ctx.translate(w, 0); ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, w, h);
+    ctx.restore();
+    return canvas.toDataURL("image/jpeg", 0.85);
+  });
 }
 
 function setStatus(text, live) {
@@ -226,17 +251,29 @@ function setStatus(text, live) {
 async function loop() {
   while (true) {
     if (paused || !video.videoWidth) { await new Promise(r => setTimeout(r, 100)); continue; }
+    const generation = capture.generation;
     try {
-      const res = await fetch("/decide", {
+      const wait = capture.waitMs(performance.now());
+      if (wait) { setStatus("sampling", false); await new Promise(r => setTimeout(r, wait)); continue; }
+      const frame = await grab();
+      if (generation !== capture.generation || paused) continue;
+      if (!frame) { capture.reset(); setStatus("sampling", false); continue; }
+      const body = capture.prepare(frame, questions);
+      if (!body) { setStatus("sampling", false); await new Promise(r => setTimeout(r, 250)); continue; }
+      const started = performance.now();
+      const res = await fetch(SYSTEMONE_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image: grab(), questions })
+        body: JSON.stringify(body)
       });
       const data = await res.json();
+      if (generation !== capture.generation || paused) continue;
       if (!res.ok) throw new Error(data.detail || res.statusText);
       update(data.answers);
-      $("lat").textContent = Math.round(data.latency_ms);
-      $("hardware").textContent = data.hardware;
+      const modelMs = inferenceTiming(res.headers.get("Server-Timing"));
+      $("lat").textContent = Math.round(modelMs ?? (performance.now() - started));
+      $("lat-label").textContent = modelMs === null ? "request latency" : "model latency";
+      $("hardware").textContent = res.headers.get("X-Clef-Hardware") || "local model";
       const now = performance.now();
       recent.push(now);
       while (now - recent[0] > 3000) recent.shift();
@@ -246,6 +283,8 @@ async function loop() {
       $("tag").textContent = TAG;
       setStatus("live", true);
     } catch (e) {
+      if (generation !== capture.generation || paused) continue;
+      capture.reset();
       setStatus("error", false);
       $("tag").textContent = `${e.message} · press E to fix, shift+R to reset`;
       await new Promise(r => setTimeout(r, 1000));
@@ -258,6 +297,7 @@ function applySchema() {
     const next = JSON.parse($("schema").value);
     if (!next || typeof next !== "object" || !Object.keys(next).length) throw new Error("need at least one question");
     questions = next;
+    capture.reset();
     localStorage.setItem("clef-questions", JSON.stringify(questions));
     $("err").textContent = "";
     $("editor").classList.remove("open");
@@ -268,6 +308,7 @@ function applySchema() {
 }
 
 document.addEventListener("keydown", e => {
+  if (e.target instanceof HTMLInputElement) return;
   const editing = $("editor").classList.contains("open");
   if (editing) {
     if (e.key === "Escape") $("editor").classList.remove("open");
@@ -275,10 +316,11 @@ document.addEventListener("keydown", e => {
     return;
   }
   if (e.key.toLowerCase() === "e" && !e.metaKey && !e.ctrlKey) { $("editor").classList.add("open"); $("schema").focus(); e.preventDefault(); }
-  if (e.key === " ") { paused = !paused; setStatus(paused ? "paused" : "live", !paused); e.preventDefault(); }
+  if (e.key === " ") { paused = !paused; capture.reset(); setStatus(paused ? "paused" : "live", !paused); e.preventDefault(); }
   if (e.key.toLowerCase() === "r" && e.shiftKey) {
     localStorage.removeItem("clef-questions");
     questions = DEFAULT_QUESTIONS;
+    capture.reset();
     $("schema").value = JSON.stringify(questions, null, 2);
     renderCards();
   }
