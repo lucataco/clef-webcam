@@ -87,7 +87,7 @@
     </div>
     <div class="stats">
       <div class="stat"><div class="k"><span class="dot" id="dot"></span>status</div><div class="v" id="status" style="font-size:20px; margin-top:10px">starting</div></div>
-      <div class="stat hot"><div class="k">model latency</div><div class="v"><span id="lat">–</span><small>ms</small></div></div>
+      <div class="stat hot"><div class="k" id="lat-label">model latency</div><div class="v"><span id="lat">–</span><small>ms</small></div></div>
       <div class="stat"><div class="k">decisions / sec</div><div class="v" id="dps">–</div></div>
     </div>
   </header>
@@ -102,7 +102,7 @@
   </main>
 
   <footer>
-    <div><b id="hardware">loading model…</b> · same request body as <b>@cf/cloudflare/clef</b> on Workers AI</div>
+    <div><b id="hardware">loading model…</b> · System One API</div>
     <div><kbd>E</kbd> edit questions &nbsp; <kbd>space</kbd> pause</div>
   </footer>
 
@@ -223,20 +223,31 @@ function setStatus(text, live) {
   $("dot").classList.toggle("live", !!live);
 }
 
+function inferenceTiming(header) {
+  const match = (header || "").match(/(?:^|,)\s*inference\s*;\s*dur=([\d.]+)/);
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
 async function loop() {
   while (true) {
     if (paused || !video.videoWidth) { await new Promise(r => setTimeout(r, 100)); continue; }
     try {
-      const res = await fetch("/decide", {
+      const started = performance.now();
+      const res = await fetch("/v1/systemone", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image: grab(), questions })
+        body: JSON.stringify({ model: "clef-flash", state: "A live webcam frame from a laptop.",
+                               images: [grab()], questions })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || res.statusText);
       update(data.answers);
-      $("lat").textContent = Math.round(data.latency_ms);
-      $("hardware").textContent = data.hardware;
+      const modelMs = inferenceTiming(res.headers.get("Server-Timing"));
+      $("lat").textContent = Math.round(modelMs ?? (performance.now() - started));
+      $("lat-label").textContent = modelMs === null ? "request latency" : "model latency";
+      $("hardware").textContent = res.headers.get("X-Clef-Hardware") || "local model";
       const now = performance.now();
       recent.push(now);
       while (now - recent[0] > 3000) recent.shift();

@@ -9,6 +9,7 @@ from PIL import Image
 from pydantic import BaseModel
 
 from clef import Clef
+from systemone_api import add_systemone_routes
 
 MAX_SIDE = int(os.environ.get("CLEF_MAX_SIDE", "336"))
 
@@ -20,6 +21,7 @@ for _ in range(2):
     clef.decide({"model": "clef-flash", "state": "warmup", "images": [warmup], "questions": {"dark": {"type": "noul"}}})
 
 app = FastAPI()
+add_systemone_routes(app, clef, MAX_SIDE)
 
 
 class DecideRequest(BaseModel):
